@@ -1,0 +1,37 @@
+version: "3.9"
+
+services:
+  app:
+    build: ./app
+    image: first-contact-app:latest
+    restart: unless-stopped
+    environment:
+      UVICORN_HOST: 0.0.0.0
+      UVICORN_PORT: "8000"
+      APP_DATA_DIR: /data
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import socket; s=socket.socket(); s.settimeout(2); s.connect((\"127.0.0.1\",8000)); print(\"ok\")'"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - app_data:/data
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      #dedicate 80/443
+      - "81:80"
+      - "444:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
+  app_data:

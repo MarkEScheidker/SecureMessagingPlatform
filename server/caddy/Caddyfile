@@ -1,0 +1,58 @@
+{
+    # email admin@yourdomain.com
+    # Optional while testing:
+    # acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+    storage file_system {
+        root /data/certificates
+    }
+}
+
+(common_site) {
+    encode zstd gzip
+
+    # Sensible security headers (tweak as needed)
+    header {
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Permissions-Policy "geolocation=(), microphone=(), camera=()"
+    }
+
+    # Reverse proxy to the FastAPI app container
+    reverse_proxy app:8000
+
+}
+
+scheidker.com {
+    import common_site
+
+    # Automatic HTTPS with ACME
+    tls {
+        issuer acme {
+            # Uses the global email defined above.
+        }
+    }
+
+    # Only add HSTS on HTTPS responses
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+    }
+
+    # Access logs (to stdout)
+    log
+}
+
+http://scheidker.com {
+    # Access logs (to stdout)
+    log
+
+    @cf_https header_regexp CF-Visitor "https"
+    handle @cf_https {
+        import common_site
+    }
+
+    handle {
+        # For plain HTTP clients (or direct origin hits), force HTTPS at the edge.
+        redir https://scheidker.com{uri} permanent
+    }
+}
