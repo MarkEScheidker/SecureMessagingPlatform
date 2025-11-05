@@ -1,4 +1,4 @@
-package securemessagingplatform
+package securemessagingplatformServer
 
 import (
 	"encoding/json"
