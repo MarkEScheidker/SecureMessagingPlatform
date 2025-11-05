@@ -27,21 +27,30 @@ class SecureSession:
         self.cipher = ChaCha20Poly1305(self.session_key)
         self.peer_role = "responder" if self.role == "initiator" else "initiator"
         self.send_counter = 0
-        self.recv_counter = 0
+        self.recv_counter = -1
 
     def _nonce(self, counter: int, role: str) -> bytes:
         prefix = b"INIT" if role == "initiator" else b"RESP"
         return prefix + struct.pack("!Q", counter)
 
-    def encrypt(self, plaintext: bytes) -> bytes:
-        nonce = self._nonce(self.send_counter, self.role)
-        self.send_counter += 1
-        return self.cipher.encrypt(nonce, plaintext, self.transcript_hash)
+    def encrypt(self, plaintext: bytes) -> tuple[int, bytes]:
+        """Encrypt plaintext and return (nonce_counter, ciphertext)."""
 
-    def decrypt(self, ciphertext: bytes) -> bytes:
-        nonce = self._nonce(self.recv_counter, self.peer_role)
-        self.recv_counter += 1
-        return self.cipher.decrypt(nonce, ciphertext, self.transcript_hash)
+        nonce_int = self.send_counter
+        nonce = self._nonce(nonce_int, self.role)
+        self.send_counter += 1
+        ciphertext = self.cipher.encrypt(nonce, plaintext, self.transcript_hash)
+        return nonce_int, ciphertext
+
+    def decrypt(self, nonce_counter: int, ciphertext: bytes) -> bytes:
+        """Decrypt ciphertext using the provided nonce counter with replay prevention."""
+
+        if nonce_counter <= self.recv_counter:
+            raise ValueError("replayed or out-of-order message")
+        nonce = self._nonce(nonce_counter, self.peer_role)
+        plaintext = self.cipher.decrypt(nonce, ciphertext, self.transcript_hash)
+        self.recv_counter = nonce_counter
+        return plaintext
 
 
 def handshake_payload(event: str, sender: str, receiver: str, eph_pub: bytes, nonce: bytes) -> bytes:
