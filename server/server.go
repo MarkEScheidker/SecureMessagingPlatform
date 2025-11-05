@@ -250,11 +250,12 @@ func RunServer() {
 	flag.Parse()
 	hub := client.NewHub()
 	go hub.Run()
-	http.HandleFunc("/", serveHome)
-	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+	wsHttp := http.NewServeMux()
+	wsHttp.HandleFunc("/", serveHome)
+	wsHttp.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		client.ServeWs(hub, w, r)
 	})
-	go startWebSocketServer()
+	go startWebSocketServer(wsHttp)
 
 	server := NewServer()
 	router := mux.NewRouter()
@@ -273,7 +274,7 @@ var upgrader = websocket.Upgrader{
 	WriteBufferSize: 1024,
 }
 
-func startWebSocketServer() {
+func startWebSocketServer(wsHttp *http.ServeMux) {
 	err := http.ListenAndServe(*addr, nil)
 	if err != nil {
 		log.Fatal("ListenAndServe: ", err)
