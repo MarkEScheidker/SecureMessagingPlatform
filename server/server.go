@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/MarkEScheidker/SecureMessagingPlatform/client"
 	"github.com/gorilla/mux"
@@ -247,9 +246,6 @@ func serveHome(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, "home.html")
 }
 
-func main() {
-}
-
 func RunServer() {
 	flag.Parse()
 	hub := client.NewHub()
@@ -258,9 +254,10 @@ func RunServer() {
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		client.ServeWs(hub, w, r)
 	})
+	go startWebSocketServer()
+
 	server := NewServer()
 	router := mux.NewRouter()
-
 	router.HandleFunc("/status", server.statusHandler).Methods("GET")
 	router.HandleFunc("/account/create", server.createAccountHandler).Methods("POST")
 	router.HandleFunc("/account/updatekey", server.registerKeyHandler).Methods("POST")
@@ -268,33 +265,19 @@ func RunServer() {
 
 	log.Println("Starting server on :8000")
 	log.Fatal(http.ListenAndServe(":8000", router))
-	err := http.ListenAndServe(*addr, nil)
-	if err != nil {
-		log.Fatal("ListenAndServe: ", err)
-	}
 
 }
-
-const (
-	// Time allowed to write a message to the peer.
-	writeWait = 10 * time.Second
-
-	// Time allowed to read the next pong message from the peer.
-	pongWait = 60 * time.Second
-
-	// Send pings to peer with this period. Must be less than pongWait.
-	pingPeriod = (pongWait * 9) / 10
-
-	// Maximum message size allowed from peer.
-	maxMessageSize = 512
-)
-
-var (
-	newline = []byte{'\n'}
-	space   = []byte{' '}
-)
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
+}
+
+func startWebSocketServer() {
+	err := http.ListenAndServe(*addr, nil)
+	if err != nil {
+		log.Fatal("ListenAndServe: ", err)
+	}
+	log.Println("Starting websocket server on", *addr)
+
 }
