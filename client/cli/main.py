@@ -1,4 +1,4 @@
-"""Command-line interface for the secure messaging client."""
+"""Command-line interface for the secure messaging client using the relay."""
 
 from __future__ import annotations
 
@@ -6,29 +6,43 @@ import argparse
 import asyncio
 import sys
 from getpass import getpass
-from typing import Optional
 
 import httpx
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
-from client.common.config import DEFAULT_PORT, DEFAULT_SERVER_URL
+from client.common.config import DEFAULT_SERVER_URL
 from client.common.state import AppState
 from client.common.utils import input_trim
-from client.network.dialer import connect_and_chat
-from client.network.discovery import discover_peers
-from client.network.keyserver import create_account, publish_public_key
-from client.network.listener import listen_once
+from client.network.keyserver import publish_public_key
+from client.network.relay import RelayClient
 
 HELP_TEXT = """Commands:
-  discover [port]           Broadcast for peers advertising over UDP (default port 4040).
-  listen [port]             Wait for an incoming secure session (default port 4040).
-  connect <peer> [port]     Dial a discovered peer (default port 4040).
-  connect <host> <peer> [port]
-                            Dial a peer at a specific host.
-  help                      Show this help.
-  quit                      Exit the program.
+  connect <peer>       Initiate a session with a peer via the relay.
+  wait                 Wait for the next incoming session request.
+  help                 Show this help message.
+  quit                 Exit the program.
 """
+
+
+async def chat_loop(relay: RelayClient) -> None:
+    print("Type /leave to close the session.")
+    while relay.session and relay.session_peer:
+        text = await asyncio.to_thread(input_trim, "you> ")
+        if not text:
+            continue
+        if text in {"/leave", "/quit"}:
+            print("Ending session.")
+            relay.session = None
+            relay.session_peer = None
+            break
+        try:
+            await relay.send_chat(text)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[session] Send failed: {exc}")
+            relay.session = None
+            relay.session_peer = None
+            break
 
 
 async def app_main(server_url: str) -> None:
@@ -55,7 +69,6 @@ async def app_main(server_url: str) -> None:
     )
 
     try:
-        await asyncio.to_thread(create_account, state.server, state.username, state.password)
         await asyncio.to_thread(
             publish_public_key,
             state.server,
@@ -74,93 +87,54 @@ async def app_main(server_url: str) -> None:
         print(f"[error] Key server rejected request: {detail}", file=sys.stderr)
         return
 
-    print("Logged in. Your key will remain in memory until you exit.")
+    relay = RelayClient(state)
+    print("Logged in. Relay connection will open on demand.")
     print(HELP_TEXT)
 
-    while True:
-        raw = await asyncio.to_thread(input_trim, "smp> ")
-        if not raw:
-            continue
-        parts = raw.split()
-        command = parts[0].lower()
-
-        if command in {"quit", "exit"}:
-            break
-        if command == "help":
-            print(HELP_TEXT)
-            continue
-        if command == "discover":
-            port = int(parts[1]) if len(parts) > 1 else DEFAULT_PORT
-            await asyncio.to_thread(discover_peers, state, port)
-            continue
-        if command == "listen":
-            port = int(parts[1]) if len(parts) > 1 else DEFAULT_PORT
-            try:
-                await listen_once(state, host="0.0.0.0", port=port)
-            except Exception as exc:  # noqa: BLE001
-                print(f"[listen] Error: {exc}")
-            continue
-        if command == "connect":
-            args = parts[1:]
-            if not args:
-                print("Usage: connect <peer> [port] or connect <host> <peer> [port]")
+    try:
+        while True:
+            raw = await asyncio.to_thread(input_trim, "smp> ")
+            if not raw:
                 continue
+            parts = raw.split()
+            command = parts[0].lower()
 
-            host: Optional[str] = None
-            peer: Optional[str] = None
-            port = DEFAULT_PORT
-
-            if len(args) == 1:
-                peer = args[0]
-                entry = state.known_peers.get(peer)
-                if not entry:
-                    print("Unknown peer; run 'discover' or specify host explicitly.")
+            if command in {"quit", "exit"}:
+                break
+            if command == "help":
+                print(HELP_TEXT)
+                continue
+            if command == "connect":
+                if len(parts) != 2:
+                    print("Usage: connect <peer>")
                     continue
-                host = entry[0]
-            elif len(args) == 2:
-                first, second = args
-                if first in state.known_peers and second.isdigit():
-                    peer = first
-                    host = state.known_peers[first][0]
-                    port = int(second)
-                else:
-                    host, peer = first, second
-            else:
-                if len(args) > 3:
-                    print("Usage: connect <peer> [port] or connect <host> <peer> [port]")
-                    continue
-                host, peer = args[0], args[1]
-                port_token = args[2]
-                if port_token.startswith("0x"):
-                    base = 16
-                    port_token_value = port_token[2:]
-                else:
-                    base = 10
-                    port_token_value = port_token
+                peer = parts[1]
                 try:
-                    port = int(port_token_value, base)
-                except ValueError:
-                    print("Port must be an integer value.")
-                    continue
-
-            if host is None or peer is None:
-                print("Usage: connect <peer> [port] or connect <host> <peer> [port]")
+                    session, version = await relay.start_handshake(peer)
+                    print(f"[session] Established with '{session.peer}' (key v{version}).")
+                    await chat_loop(relay)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[connect] Failed: {exc}")
+                continue
+            if command in {"wait", "listen"}:
+                print("Waiting for incoming session...")
+                try:
+                    peer, session, version = await relay.wait_for_incoming()
+                    print(f"[session] Established with '{peer}' (key v{version}).")
+                    await chat_loop(relay)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[wait] Failed: {exc}")
                 continue
 
-            try:
-                await connect_and_chat(state, host, port, peer)
-            except Exception as exc:  # noqa: BLE001
-                print(f"[dial] Error: {exc}")
-            continue
-
-        print("Unknown command. Type 'help' for options.")
-
-    print("Clearing session secrets and exiting.")
+            print("Unknown command. Type 'help' for options.")
+    finally:
+        await relay.close()
+        print("Clearing session secrets and exiting.")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Secure messaging CLI using a trusted introducer server.",
+        description="Secure messaging CLI using the websocket relay server.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--server", default=DEFAULT_SERVER_URL, help="Key server base URL.")
