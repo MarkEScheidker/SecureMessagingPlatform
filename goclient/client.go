@@ -1,840 +1,666 @@
-package client
+package main
 
 import (
 	"bufio"
 	"bytes"
+	"crypto/cipher"
+	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/sha256"
-	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
-	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
-	"log"
-	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
-	"time"
 
+	"github.com/chzyer/readline"
 	"github.com/gorilla/websocket"
+	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/curve25519"
+	"golang.org/x/crypto/hkdf"
 )
 
 const (
-	baseURL        = "http://localhost:8000"
-	keySize        = 2048
-	privateKeyFile = "private_key.pem"
-	publicKeyFile  = "public_key.pem"
+	defaultServer = "https://scheidker.com"
+	protocolTag   = "smproto-v1"
 )
 
-// Client represents the chat client
-type Client struct {
-	username   string
-	password   string
-	privateKey *rsa.PrivateKey
-	publicKey  *rsa.PublicKey
-	httpClient *http.Client
-	hub        *Hub
-
-	// The websocket connection.
-	conn *websocket.Conn
-
-	// Buffered channel of outbound messages.
-	send chan []byte
-	// keysDir    string
+type appState struct {
+	username string
+	password string
+	server   string
+	priv     ed25519.PrivateKey
+	pub      ed25519.PublicKey
 }
 
-// NewClient creates a new chat client
-func NewClient() *Client {
-	// homeDir, _ := os.UserHomeDir()
-	// keysDir := filepath.Join(homeDir, ".chat_keys")
-	// os.MkdirAll(keysDir, 0700)
-
-	return &Client{
-		httpClient: &http.Client{},
-	}
+type session struct {
+	role        string
+	peer        string
+	cipher      cipher.AEAD
+	transcript  []byte
+	sendCounter uint64
+	recvCounter int64
 }
 
-// AccountCreate represents account creation request
-type AccountCreate struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
+type wsClient struct {
+	conn     *websocket.Conn
+	incoming chan map[string]interface{}
 }
 
-// KeyRegister represents key registration request
-type KeyRegister struct {
-	Username  string `json:"username"`
-	Password  string `json:"password"`
-	PublicKey string `json:"public_key"`
-}
-
-// PublicKey represents the public key response
-type PublicKey struct {
-	Username   string `json:"username"`
-	PublicKey  string `json:"public_key"`
-	KeyVersion int    `json:"key_version"`
-}
-
-// ErrorResponse represents an error response
-type ErrorResponse struct {
-	Detail string `json:"detail"`
-}
-
-// generateKeyPair generates a new RSA key pair
-func generateKeyPair() (*rsa.PrivateKey, *rsa.PublicKey, error) {
-	privateKey, err := rsa.GenerateKey(rand.Reader, keySize)
-	if err != nil {
-		return nil, nil, err
-	}
-	return privateKey, &privateKey.PublicKey, nil
-}
-
-// publicKeyToPEM converts public key to PEM format
-func publicKeyToPEM(key *rsa.PublicKey) ([]byte, error) {
-	publicKeyBytes, err := x509.MarshalPKIXPublicKey(key)
-	if err != nil {
-		return nil, err
-	}
-	publicKeyPEM := pem.EncodeToMemory(&pem.Block{
-		Type:  "RSA PUBLIC KEY",
-		Bytes: publicKeyBytes,
-	})
-	return publicKeyPEM, nil
-}
-
-// pemToPublicKey converts PEM to public key
-func pemToPublicKey(pemBytes []byte) (*rsa.PublicKey, error) {
-	block, _ := pem.Decode(pemBytes)
-	if block == nil {
-		return nil, fmt.Errorf("failed to decode PEM block")
-	}
-	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
-	if err != nil {
-		return nil, err
-	}
-	publicKey, ok := pub.(*rsa.PublicKey)
-	if !ok {
-		return nil, fmt.Errorf("not an RSA public key")
-	}
-	return publicKey, nil
-}
-
-// generateAndSaveKeys generates a new key pair and saves it in memory
-func (c *Client) generateEphimerialKeys() error {
-	privateKey, publicKey, err := generateKeyPair()
-	if err != nil {
-		return fmt.Errorf("failed to generate key pair: %v", err)
-	}
-
-	// // Save private key
-	// privateKeyPath := filepath.Join(c.keysDir, fmt.Sprintf("%s_%s", c.username, privateKeyFile))
-	// privateKeyPEM := privateKeyToPEM(privateKey)
-	// if err := os.WriteFile(privateKeyPath, privateKeyPEM, 0600); err != nil {
-	// 	return fmt.Errorf("failed to save private key: %v", err)
-	// }
-
-	// // Save public key
-	// publicKeyPath := filepath.Join(c.keysDir, fmt.Sprintf("%s_%s", c.username, publicKeyFile))
-	// publicKeyPEM, err := publicKeyToPEM(publicKey)
-	// if err != nil {
-	// 	return fmt.Errorf("failed to encode public key: %v", err)
-	// }
-	// if err := os.WriteFile(publicKeyPath, publicKeyPEM, 0644); err != nil {
-	// 	return fmt.Errorf("failed to save public key: %v", err)
-	// }
-
-	c.privateKey = privateKey
-	c.publicKey = publicKey
-
-	// fmt.Printf("Keys generated and saved to: %s\n", c.keysDir)
-	return nil
-}
-
-// // loadKeys loads keys from disk
-// func (c *Client) loadKey(keyFile, keyType string) error {
-// 	if c.username == "" {
-// 		return fmt.Errorf("not logged in")
-// 	}
-
-// 	privateKeyPath := filepath.Join(c.keysDir, fmt.Sprintf("%s_%s", c.username, privateKeyFile))
-// 	publicKeyPath := filepath.Join(c.keysDir, fmt.Sprintf("%s_%s", c.username, publicKeyFile))
-
-// 	// Load private key
-
-// 	privateKeyPEM, err := os.ReadFile(privateKeyPath)
-// 	if err != nil {
-// 		return fmt.Errorf("failed to read private key: %v", err)
-// 	}
-// 	privateKey, err := pemToPrivateKey(privateKeyPEM)
-// 	if err != nil {
-// 		return fmt.Errorf("failed to parse private key: %v", err)
-// 	}
-
-// 	// Load public key
-// 	publicKeyPEM, err := os.ReadFile(publicKeyPath)
-// 	if err != nil {
-// 		return fmt.Errorf("failed to read public key: %v", err)
-// 	}
-// 	publicKey, err := pemToPublicKey(publicKeyPEM)
-// 	if err != nil {
-// 		return fmt.Errorf("failed to parse public key: %v", err)
-// 	}
-
-// 	c.privateKey = privateKey
-// 	c.publicKey = publicKey
-
-// 	fmt.Println("Keys loaded successfully")
-// 	return nil
-// }
-
-// getPublicKeyString returns the public key as a PEM string
-func (c *Client) getPublicKeyString() (string, error) {
-	if c.publicKey == nil {
-		return "", fmt.Errorf("no public key loaded")
-	}
-	publicKeyPEM, err := publicKeyToPEM(c.publicKey)
-	if err != nil {
-		return "", err
-	}
-	return string(publicKeyPEM), nil
-}
-
-// makeRequest makes an HTTP request and handles errors
-func (c *Client) makeRequest(method, url string, body interface{}) ([]byte, int, error) {
-	var reqBody io.Reader
-	if body != nil {
-		jsonData, err := json.Marshal(body)
-		if err != nil {
-			return nil, 0, err
-		}
-		reqBody = bytes.NewBuffer(jsonData)
-	}
-
-	req, err := http.NewRequest(method, url, reqBody)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, resp.StatusCode, err
-	}
-
-	return respBody, resp.StatusCode, nil
-}
-
-// createAccount creates a new account
-func (c *Client) createAccount(username, password string) error {
-	payload := AccountCreate{
-		Username: username,
-		Password: password,
-	}
-
-	respBody, statusCode, err := c.makeRequest("POST", baseURL+"/account/create", payload)
-	if err != nil {
-		return fmt.Errorf("request failed: %v", err)
-	}
-
-	if statusCode != http.StatusCreated {
-		var errResp ErrorResponse
-		if err := json.Unmarshal(respBody, &errResp); err == nil {
-			return fmt.Errorf("failed to create account: %s", errResp.Detail)
-		}
-		return fmt.Errorf("failed to create account: status %d", statusCode)
-	}
-
-	c.username = username
-	c.password = password
-	return nil
-}
-
-// registerKey registers a public key for the user
-func (c *Client) registerKey(publicKey string) error {
-	if c.username == "" || c.password == "" {
-		return fmt.Errorf("not logged in")
-	}
-
-	payload := KeyRegister{
-		Username:  c.username,
-		Password:  c.password,
-		PublicKey: publicKey,
-	}
-
-	respBody, statusCode, err := c.makeRequest("POST", baseURL+"/account/updatekey", payload)
-	if err != nil {
-		return fmt.Errorf("request failed: %v", err)
-	}
-
-	if statusCode != http.StatusOK {
-		var errResp ErrorResponse
-		if err := json.Unmarshal(respBody, &errResp); err == nil {
-			return fmt.Errorf("failed to register key: %s", errResp.Detail)
-		}
-		return fmt.Errorf("failed to register key: status %d", statusCode)
-	}
-
-	return nil
-}
-
-// getKey retrieves a user's public key
-func (c *Client) getKey(username string) (*PublicKey, error) {
-	url := fmt.Sprintf("%s/keys/%s", baseURL, username)
-	respBody, statusCode, err := c.makeRequest("GET", url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %v", err)
-	}
-
-	if statusCode != http.StatusOK {
-		var errResp ErrorResponse
-		if err := json.Unmarshal(respBody, &errResp); err == nil {
-			return nil, fmt.Errorf("failed to get key: %s", errResp.Detail)
-		}
-		return nil, fmt.Errorf("failed to get key: status %d", statusCode)
-	}
-
-	var pubKey PublicKey
-	if err := json.Unmarshal(respBody, &pubKey); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %v", err)
-	}
-
-	return &pubKey, nil
-}
-
-// login simulates logging in by storing credentials
-func (c *Client) login(username, password string) error {
-	c.username = username
-	c.password = password
-
-	accountCreateErr := c.createAccount(username, password)
-	if accountCreateErr != nil {
-		return accountCreateErr
-	}
-	// Try to load existing keys
-	if err := c.generateEphimerialKeys(); err != nil {
-		fmt.Println("Failed to generate keys:", err)
-		return err
-	}
-	keyStr, err := c.getPublicKeyString()
-	if err != nil {
-		return fmt.Errorf("failed to get public key: %v", err)
-	}
-
-	return c.registerKey(keyStr)
-}
-
-// encryptWithPublicKey encrypts a message using RSA-OAEP and returns base64 string
-func encryptWithPublicKey(pub *rsa.PublicKey, msg []byte) (string, error) {
-	hash := sha256.New()
-	cipherBytes, err := rsa.EncryptOAEP(hash, rand.Reader, pub, msg, nil)
-	if err != nil {
-		return "", err
-	}
-	return base64.StdEncoding.EncodeToString(cipherBytes), nil
-}
-
-// decryptWithPrivateKey decrypts a base64 RSA-OAEP encrypted message
-func decryptWithPrivateKey(priv *rsa.PrivateKey, b64 string) (string, error) {
-	cipherBytes, err := base64.StdEncoding.DecodeString(b64)
-	if err != nil {
-		return "", err
-	}
-	hash := sha256.New()
-	plain, err := rsa.DecryptOAEP(hash, rand.Reader, priv, cipherBytes, nil)
-	if err != nil {
-		return "", err
-	}
-	return string(plain), nil
-}
-
-// serve starts a TCP listener on the given port and accepts incoming chat connections.
-// Each incoming connection is handled in its own goroutine.
-func (c *Client) serve(port string, wg *sync.WaitGroup) error {
-	ln, err := net.Listen("tcp", ":"+port)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("Listening on %s\n", ln.Addr().String())
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				log.Println("accept error:", err)
-				continue
-			}
-			go c.handleConn(conn)
-		}
-	}()
-
-	return nil
-}
-
-// handleConn handles a single incoming connection and reads JSON lines:
-// {"from":"username","message":"<base64-cipher>"}
-func (c *Client) handleConn(conn net.Conn) {
-	defer conn.Close()
-	r := bufio.NewReader(conn)
-	for {
-		line, err := r.ReadString('\n')
-		if err != nil {
-			if err != io.EOF {
-				log.Println("read error:", err)
-			}
-			return
-		}
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		var pkt struct {
-			From    string `json:"from"`
-			Message string `json:"message"`
-		}
-		if err := json.Unmarshal([]byte(line), &pkt); err != nil {
-			log.Println("invalid message format:", err)
-			continue
-		}
-		if c.privateKey == nil {
-			log.Println("received message but no private key loaded")
-			continue
-		}
-		plain, err := decryptWithPrivateKey(c.privateKey, pkt.Message)
-		if err != nil {
-			log.Println("failed to decrypt message:", err)
-			continue
-		}
-		fmt.Printf("\n[%s] %s\n", pkt.From, plain)
-	}
-}
-
-// connectAndChat connects to address (host:port), fetches the recipient's public key using getKey(username),
-// then enters an interactive loop: stdin lines are encrypted and sent; /quit to exit.
-func (c *Client) connectAndChat(username, address string) error {
-	if c.privateKey == nil {
-		return fmt.Errorf("load keys first")
-	}
-	// fetch remote public key from server
-	pubResp, err := c.getKey(username)
-	if err != nil {
-		return fmt.Errorf("failed to get public key for %s: %v", username, err)
-	}
-
-	remotePub, err := pemToPublicKey([]byte(pubResp.PublicKey))
-	if err != nil {
-		return fmt.Errorf("failed to parse remote public key: %v", err)
-	}
-
-	conn, err := net.Dial("tcp", address)
-	if err != nil {
-		return fmt.Errorf("failed to connect to %s: %v", address, err)
-	}
-	defer conn.Close()
-
-	// start reader goroutine
-	go func() {
-		r := bufio.NewReader(conn)
-		for {
-			line, err := r.ReadString('\n')
-			if err != nil {
-				if err != io.EOF {
-					log.Println("read error:", err)
-				}
-				return
-			}
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-			var pkt struct {
-				From    string `json:"from"`
-				Message string `json:"message"`
-			}
-			if err := json.Unmarshal([]byte(line), &pkt); err != nil {
-				log.Println("invalid message format:", err)
-				continue
-			}
-			if c.privateKey == nil {
-				log.Println("received message but no private key loaded")
-				continue
-			}
-			plain, err := decryptWithPrivateKey(c.privateKey, pkt.Message)
-			if err != nil {
-				log.Println("failed to decrypt message:", err)
-				continue
-			}
-			fmt.Printf("\n[%s] %s\n", pkt.From, plain)
-		}
-	}()
-
-	fmt.Printf("Connected to %s. Type messages and press Enter. Type /quit to exit.\n", address)
-	stdin := bufio.NewScanner(os.Stdin)
-	for {
-		if !stdin.Scan() {
-			break
-		}
-		text := stdin.Text()
-		if strings.TrimSpace(text) == "/quit" {
-			break
-		}
-		cipherText, err := encryptWithPublicKey(remotePub, []byte(text))
-		if err != nil {
-			fmt.Printf("Encryption error: %v\n", err)
-			continue
-		}
-		pkt := map[string]string{
-			"from":    c.username,
-			"message": cipherText,
-		}
-		out, _ := json.Marshal(pkt)
-		_, err = conn.Write(append(out, '\n'))
-		if err != nil {
-			fmt.Printf("Send error: %v\n", err)
-			break
-		}
-	}
-
-	return nil
-}
-
-func printHelp() {
-	fmt.Println("\nAvailable commands:")
-	fmt.Println("  register <username> <password> - Create a new account")
-	fmt.Println("  login <username> <password>    - Login to existing account")
-	fmt.Println("  showpubkey                     - Display your public key")
-	fmt.Println("  getkey <username>              - Get a user's public key from server")
-	fmt.Println("  whoami                         - Show current username")
-	fmt.Println("  help                           - Show this help message")
-	fmt.Println("  quit or exit                   - Exit the client")
-	fmt.Println()
-}
-
-func RunClient() {
-	client := NewClient()
-	scanner := bufio.NewScanner(os.Stdin)
-	var listenerWG sync.WaitGroup
-
-	fmt.Println("=== Public Key Chat Client ===")
-	fmt.Println("Type 'help' for available commands")
-	fmt.Println()
-
-	for {
-		if client.username != "" {
-			fmt.Printf("[%s]> ", client.username)
-		} else {
-			fmt.Print("> ")
-		}
-
-		if !scanner.Scan() {
-			break
-		}
-
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-
-		parts := strings.Fields(line)
-		if len(parts) == 0 {
-			continue
-		}
-
-		command := parts[0]
-
-		switch command {
-		case "help":
-			printHelp()
-
-		case "register":
-			if len(parts) != 3 {
-				fmt.Println("Usage: register <username> <password>")
-				continue
-			}
-			username, password := parts[1], parts[2]
-			if err := client.createAccount(username, password); err != nil {
-				fmt.Printf("Error: %v\n", err)
-			} else {
-				fmt.Printf("Account created successfully! Logged in as %s\n", username)
-			}
-
-		case "login":
-			if len(parts) != 3 {
-				fmt.Println("Usage: login <username> <password>")
-				continue
-			}
-			username, password := parts[1], parts[2]
-			if err := client.login(username, password); err != nil {
-				fmt.Printf("Error: %v\n", err)
-			} else {
-				fmt.Printf("Logged in as %s\n", username)
-			}
-		case "showpubkey":
-			pubKeyStr, err := client.getPublicKeyString()
-			if err != nil {
-				fmt.Printf("Error: %v\n", err)
-			} else {
-				fmt.Println("\nYour Public Key:")
-				fmt.Println(pubKeyStr)
-			}
-
-		case "uploadkey":
-			if client.username == "" {
-				fmt.Println("Error: Please login first")
-				continue
-			}
-			pubKeyStr, err := client.getPublicKeyString()
-			if err != nil {
-				fmt.Printf("Error: %v\n", err)
-				continue
-			}
-			if err := client.registerKey(pubKeyStr); err != nil {
-				fmt.Printf("Error: %v\n", err)
-			} else {
-				fmt.Println("Public key uploaded successfully!")
-			}
-
-		case "getkey":
-			if len(parts) != 2 {
-				fmt.Println("Usage: getkey <username>")
-				continue
-			}
-			username := parts[1]
-			pubKey, err := client.getKey(username)
-			if err != nil {
-				fmt.Printf("Error: %v\n", err)
-			} else {
-				fmt.Printf("\nUsername: %s\n", pubKey.Username)
-				fmt.Printf("Key Version: %d\n", pubKey.KeyVersion)
-				fmt.Printf("Public Key:\n%s\n", pubKey.PublicKey)
-			}
-
-		case "serve":
-			if len(parts) != 2 {
-				fmt.Println("Usage: serve <port>")
-				continue
-			}
-			if client.privateKey == nil {
-				fmt.Println("Error: load or generate keys before starting server")
-				continue
-			}
-			port := parts[1]
-			if err := client.serve(port, &listenerWG); err != nil {
-				fmt.Printf("Error starting listener: %v\n", err)
-			}
-
-		case "connect":
-			if len(parts) != 3 {
-				fmt.Println("Usage: connect <username> <host:port>")
-				continue
-			}
-			if client.privateKey == nil {
-				fmt.Println("Error: load or generate keys before connecting")
-				continue
-			}
-			username := parts[1]
-			addr := parts[2]
-			if err := client.connectAndChat(username, addr); err != nil {
-				fmt.Printf("Error: %v\n", err)
-			}
-
-		case "whoami":
-			if client.username != "" {
-				fmt.Printf("Logged in as: %s\n", client.username)
-				if client.publicKey != nil {
-					fmt.Println("Keys loaded: Yes")
-				} else {
-					fmt.Println("Keys loaded: No")
-				}
-			} else {
-				fmt.Println("Not logged in")
-			}
-
-		case "quit", "exit":
-			fmt.Println("Goodbye!")
-			// allow listener goroutines to finish (they run until program exit)
-			return
-
-		default:
-			fmt.Printf("Unknown command: %s (type 'help' for available commands)\n", command)
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading input: %v\n", err)
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-// serveWs handles websocket requests from the peer.
-func ServeWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
+func run() error {
+	reader := bufio.NewReader(os.Stdin)
+	username := prompt(reader, "Username: ")
+	password := prompt(reader, "Password: ")
+	if password == "" {
+		return errors.New("password cannot be empty")
+	}
+
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		log.Println(err)
-		return
+		return err
 	}
-	client := &Client{hub: hub, conn: conn, send: make(chan []byte, 256)}
-	client.hub.register <- client
+	state := &appState{
+		username: username,
+		password: password,
+		server:   defaultServer,
+		priv:     priv,
+		pub:      pub,
+	}
 
-	// Allow collection of memory referenced by the caller by doing all work in
-	// new goroutines.
-	go client.writePump()
-	go client.readPump()
-}
+	if err := publishKey(state); err != nil {
+		return err
+	}
+	fmt.Println("[key-server] identity stored.")
 
-const (
-	// Time allowed to write a message to the peer.
-	writeWait = 10 * time.Second
+	wsURL, err := buildWSURL(state.server, state.username)
+	if err != nil {
+		return err
+	}
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
 
-	// Time allowed to read the next pong message from the peer.
-	pongWait = 60 * time.Second
+	client := newWSClient(conn)
 
-	// Send pings to peer with this period. Must be less than pongWait.
-	pingPeriod = (pongWait * 9) / 10
-
-	// Maximum message size allowed from peer.
-	maxMessageSize = 512
-)
-
-var (
-	newline = []byte{'\n'}
-	space   = []byte{' '}
-)
-
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-}
-
-// readPump pumps messages from the websocket connection to the hub.
-//
-// The application runs readPump in a per-connection goroutine. The application
-// ensures that there is at most one reader on a connection by executing all
-// reads from this goroutine.
-func (c *Client) readPump() {
-	defer func() {
-		c.hub.unregister <- c
-		c.conn.Close()
-	}()
-	c.conn.SetReadLimit(maxMessageSize)
-	c.conn.SetReadDeadline(time.Now().Add(pongWait))
-	c.conn.SetPongHandler(func(string) error { c.conn.SetReadDeadline(time.Now().Add(pongWait)); return nil })
 	for {
-		_, message, err := c.conn.ReadMessage()
+		peer, err := promptPeer(reader)
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("error: %v", err)
-			}
-			break
+			return err
 		}
-		message = bytes.TrimSpace(bytes.Replace(message, newline, space, -1))
-		c.hub.broadcast <- message
+		sess, err := connectPeer(client, state, peer)
+		if err != nil {
+			fmt.Printf("[connect] %v\n", err)
+			continue
+		}
+		chat(client, sess)
+		reader = bufio.NewReader(os.Stdin)
 	}
 }
 
-// writePump pumps messages from the hub to the websocket connection.
-//
-// A goroutine running writePump is started for each connection. The
-// application ensures that there is at most one writer to a connection by
-// executing all writes from this goroutine.
-func (c *Client) writePump() {
-	ticker := time.NewTicker(pingPeriod)
-	defer func() {
-		ticker.Stop()
-		c.conn.Close()
-	}()
+func promptPeer(reader *bufio.Reader) (string, error) {
 	for {
-		select {
-		case message, ok := <-c.send:
-			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if !ok {
-				// The hub closed the channel.
-				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+		fmt.Print("Connect to username: ")
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return "", err
+		}
+		peer := strings.TrimSpace(line)
+		if peer != "" {
+			return peer, nil
+		}
+	}
+}
+
+func newWSClient(conn *websocket.Conn) *wsClient {
+	c := &wsClient{
+		conn:     conn,
+		incoming: make(chan map[string]interface{}, 8),
+	}
+	go func() {
+		for {
+			var msg map[string]interface{}
+			if err := conn.ReadJSON(&msg); err != nil {
+				close(c.incoming)
 				return
 			}
+			c.incoming <- msg
+		}
+	}()
+	return c
+}
 
-			w, err := c.conn.NextWriter(websocket.TextMessage)
+func (c *wsClient) send(to, msgType string, payload interface{}) error {
+	envelope := map[string]interface{}{
+		"to":      to,
+		"type":    msgType,
+		"payload": payload,
+	}
+	return c.conn.WriteJSON(envelope)
+}
+
+func (c *wsClient) nextMessage() (map[string]interface{}, error) {
+	msg, ok := <-c.incoming
+	if !ok {
+		return nil, errors.New("connection closed")
+	}
+	return msg, nil
+}
+
+func publishKey(state *appState) error {
+	body, _ := json.Marshal(map[string]string{
+		"username":   state.username,
+		"password":   state.password,
+		"public_key": base64.StdEncoding.EncodeToString(state.pub),
+	})
+	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(state.server, "/")+"/keys", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("key server returned %s", resp.Status)
+	}
+	return nil
+}
+
+func fetchKey(server, username string) ([]byte, int, error) {
+	endpoint := strings.TrimRight(server, "/") + "/keys/" + url.PathEscape(username)
+	resp, err := http.Get(endpoint)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, 0, fmt.Errorf("lookup failed: %s", resp.Status)
+	}
+	var data struct {
+		PublicKey  string `json:"public_key"`
+		KeyVersion int    `json:"key_version"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return nil, 0, err
+	}
+	pub, err := base64.StdEncoding.DecodeString(data.PublicKey)
+	return pub, data.KeyVersion, err
+}
+
+func connectPeer(client *wsClient, state *appState, peer string) (*session, error) {
+	peer = strings.TrimSpace(peer)
+	if peer == "" {
+		return nil, errors.New("peer cannot be empty")
+	}
+	if peer == state.username {
+		return nil, errors.New("cannot chat with yourself")
+	}
+	if state.username < peer {
+		return startSession(client, state, peer)
+	}
+	return waitForPeerSession(client, state, peer)
+}
+
+func startSession(client *wsClient, state *appState, peer string) (*session, error) {
+	peerKey, version, err := fetchKey(state.server, peer)
+	if err != nil {
+		return nil, err
+	}
+	priv, pub, err := generateEphemeral()
+	if err != nil {
+		return nil, err
+	}
+	nonce, err := randomBytes(16)
+	if err != nil {
+		return nil, err
+	}
+	payload := handshakePayload("init", state.username, peer, pub, nonce)
+	sig := ed25519.Sign(state.priv, payload)
+	msg := map[string]string{
+		"username":  state.username,
+		"target":    peer,
+		"ephemeral": base64.StdEncoding.EncodeToString(pub),
+		"nonce":     base64.StdEncoding.EncodeToString(nonce),
+		"signature": base64.StdEncoding.EncodeToString(sig),
+	}
+	if err := client.send(peer, "handshake_init", msg); err != nil {
+		return nil, err
+	}
+	for {
+		msg, err := client.nextMessage()
+		if err != nil {
+			return nil, err
+		}
+		if msg["type"] != "handshake_accept" || msg["from"] != peer {
+			continue
+		}
+		payload, _ := msg["payload"].(map[string]interface{})
+		if payload == nil {
+			fmt.Println("[connect] empty payload, ignoring")
+			continue
+		}
+		sess, err := completeInitiator(state, peer, peerKey, priv, pub, nonce, payload)
+		if err != nil {
+			return nil, err
+		}
+		fmt.Printf("[session] connected to %s (key v%d)\n", peer, version)
+		return sess, nil
+	}
+}
+
+func waitForPeerSession(client *wsClient, state *appState, peer string) (*session, error) {
+	fmt.Printf("Waiting for %s to connect...\n", peer)
+	for {
+		msg, err := client.nextMessage()
+		if err != nil {
+			return nil, err
+		}
+		if msg["type"] != "handshake_init" {
+			continue
+		}
+		payload, _ := msg["payload"].(map[string]interface{})
+		if payload == nil {
+			continue
+		}
+		from := fmt.Sprint(msg["from"])
+		if from != peer {
+			continue
+		}
+		sess, reply, version, err := acceptResponder(state, peer, payload)
+		if err != nil {
+			continue
+		}
+		if err := client.send(peer, "handshake_accept", reply); err != nil {
+			return nil, err
+		}
+		fmt.Printf("[session] connected to %s (key v%d)\n", peer, version)
+		return sess, nil
+	}
+}
+
+func chat(client *wsClient, sess *session) {
+	const promptLabel = "you> "
+	fmt.Printf("Chatting with %s. Use /leave to exit.\n", sess.peer)
+
+	rl, err := readline.New(promptLabel)
+	if err != nil {
+		fmt.Printf("[chat] failed to initialize prompt: %v\n", err)
+		return
+	}
+
+	input := make(chan string, 32)
+	stop := make(chan struct{})
+	var readerWG sync.WaitGroup
+	readerWG.Add(1)
+	go func() {
+		defer readerWG.Done()
+		defer close(input)
+		for {
+			line, err := rl.Readline()
+			if err == readline.ErrInterrupt {
+				select {
+				case input <- "/leave":
+				case <-stop:
+				}
+				continue
+			}
 			if err != nil {
 				return
 			}
-			w.Write(message)
-
-			// Add queued chat messages to the current websocket message.
-			n := len(c.send)
-			for i := 0; i < n; i++ {
-				w.Write(newline)
-				w.Write(<-c.send)
-			}
-
-			if err := w.Close(); err != nil {
-				return
-			}
-		case <-ticker.C:
-			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			select {
+			case input <- line:
+			case <-stop:
 				return
 			}
 		}
+	}()
+	var cleanupOnce sync.Once
+	cleanup := func() {
+		cleanupOnce.Do(func() {
+			close(stop)
+			rl.Close()
+			readerWG.Wait()
+		})
 	}
-}
+	defer cleanup()
 
-func (h *Hub) Run() {
+	clearPrompt := func() {
+		rl.Clean()
+	}
+
+	sentLeave := false
+	notifyPeerLeave := func() {
+		if sentLeave {
+			return
+		}
+		sentLeave = true
+		_ = client.send(sess.peer, "chat_leave", map[string]string{"reason": "peer_left"})
+	}
+
 	for {
 		select {
-		case client := <-h.register:
-			h.clients[client] = true
-		case client := <-h.unregister:
-			if _, ok := h.clients[client]; ok {
-				delete(h.clients, client)
-				close(client.send)
+		case line, ok := <-input:
+			if !ok {
+				notifyPeerLeave()
+				clearPrompt()
+				cleanup()
+				fmt.Println("Session closed.")
+				return
 			}
-		case message := <-h.broadcast:
-			for client := range h.clients {
-				select {
-				case client.send <- message:
-				default:
-					close(client.send)
-					delete(h.clients, client)
+			line = strings.TrimSpace(line)
+			if line == "" {
+				rl.Refresh()
+				continue
+			}
+			if line == "/leave" || line == "/quit" {
+				notifyPeerLeave()
+				clearPrompt()
+				cleanup()
+				fmt.Println("Session closed.")
+				return
+			}
+			if err := sendChat(client, sess, line); err != nil {
+				clearPrompt()
+				cleanup()
+				fmt.Printf("[chat] %v\n", err)
+				return
+			}
+			rl.Refresh()
+		case msg, ok := <-client.incoming:
+			if !ok {
+				clearPrompt()
+				cleanup()
+				fmt.Println("[relay] connection closed.")
+				return
+			}
+			if msg["type"] == "chat" && msg["from"] == sess.peer {
+				if err := displayChat(sess, msg["payload"], rl.Stdout()); err != nil {
+					clearPrompt()
+					cleanup()
+					fmt.Printf("[chat] %v\n", err)
+					return
 				}
+				rl.Refresh()
+				continue
+			} else if msg["type"] == "chat_leave" && msg["from"] == sess.peer {
+				clearPrompt()
+				cleanup()
+				fmt.Printf("[session] %s left the chat.\n", sess.peer)
+				return
+			} else {
+				fmt.Fprintf(rl.Stdout(), "[relay] %s from %v\n", msg["type"], msg["from"])
+				rl.Refresh()
 			}
 		}
 	}
 }
 
-// Hub maintains the set of active clients and broadcasts messages to the
-// clients.
-type Hub struct {
-	// Registered clients.
-	clients map[*Client]bool
-
-	// Inbound messages from the clients.
-	broadcast chan []byte
-
-	// Register requests from the clients.
-	register chan *Client
-
-	// Unregister requests from clients.
-	unregister chan *Client
+func sendChat(client *wsClient, sess *session, text string) error {
+	counter, ciphertext, err := sess.encrypt([]byte(text))
+	if err != nil {
+		return err
+	}
+	payload := map[string]interface{}{
+		"nonce":      counter,
+		"ciphertext": base64.StdEncoding.EncodeToString(ciphertext),
+	}
+	return client.send(sess.peer, "chat", payload)
 }
 
-func NewHub() *Hub {
-	return &Hub{
-		broadcast:  make(chan []byte),
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
-		clients:    make(map[*Client]bool),
+func displayChat(sess *session, payload interface{}, w io.Writer) error {
+	data, _ := payload.(map[string]interface{})
+	if data == nil {
+		return errors.New("missing chat payload")
 	}
+	nonceFloat, _ := data["nonce"].(float64)
+	ctString, _ := data["ciphertext"].(string)
+	ciphertext, err := base64.StdEncoding.DecodeString(ctString)
+	if err != nil {
+		return err
+	}
+	plain, err := sess.decrypt(uint64(nonceFloat), ciphertext)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "%s> %s\n", sess.peer, string(plain))
+	return nil
+}
+
+func completeInitiator(state *appState, peer string, peerKey []byte, ephPriv [32]byte, localEph []byte, localNonce []byte, payload map[string]interface{}) (*session, error) {
+	if payload == nil {
+		return nil, errors.New("missing payload")
+	}
+	nonceStr, _ := payload["nonce"].(string)
+	ephStr, _ := payload["ephemeral"].(string)
+	sigStr, _ := payload["signature"].(string)
+	peerNonce, err := base64.StdEncoding.DecodeString(nonceStr)
+	if err != nil {
+		return nil, err
+	}
+	peerEph, err := base64.StdEncoding.DecodeString(ephStr)
+	if err != nil {
+		return nil, err
+	}
+	peerSig, err := base64.StdEncoding.DecodeString(sigStr)
+	if err != nil {
+		return nil, err
+	}
+	acceptPayload := handshakePayload("accept", peer, state.username, peerEph, peerNonce)
+	if !ed25519.Verify(ed25519.PublicKey(peerKey), acceptPayload, peerSig) {
+		return nil, errors.New("signature mismatch")
+	}
+	return deriveSession("initiator", state.username, peer, ephPriv, localEph, peerEph, localNonce, peerNonce)
+}
+
+func acceptResponder(state *appState, expected string, payload map[string]interface{}) (*session, map[string]string, int, error) {
+	username, _ := payload["username"].(string)
+	target, _ := payload["target"].(string)
+	if username == "" || target != state.username || username != expected {
+		return nil, nil, 0, errors.New("target mismatch")
+	}
+	nonceStr, _ := payload["nonce"].(string)
+	ephStr, _ := payload["ephemeral"].(string)
+	sigStr, _ := payload["signature"].(string)
+	remoteNonce, err := base64.StdEncoding.DecodeString(nonceStr)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	remoteEph, err := base64.StdEncoding.DecodeString(ephStr)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	remoteSig, err := base64.StdEncoding.DecodeString(sigStr)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	peerKey, version, err := fetchKey(state.server, username)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	initPayload := handshakePayload("init", username, state.username, remoteEph, remoteNonce)
+	if !ed25519.Verify(ed25519.PublicKey(peerKey), initPayload, remoteSig) {
+		return nil, nil, 0, errors.New("signature mismatch")
+	}
+	respPriv, respPub, err := generateEphemeral()
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	localNonce, err := randomBytes(16)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	respPayload := handshakePayload("accept", state.username, username, respPub, localNonce)
+	respSig := ed25519.Sign(state.priv, respPayload)
+	sess, err := deriveSession("responder", state.username, username, respPriv, respPub, remoteEph, localNonce, remoteNonce)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	reply := map[string]string{
+		"username":  state.username,
+		"expected":  username,
+		"ephemeral": base64.StdEncoding.EncodeToString(respPub),
+		"nonce":     base64.StdEncoding.EncodeToString(localNonce),
+		"signature": base64.StdEncoding.EncodeToString(respSig),
+	}
+	return sess, reply, version, nil
+}
+
+func deriveSession(role, username, peer string, priv [32]byte, localEph, remoteEph, localNonce, remoteNonce []byte) (*session, error) {
+	shared, err := curve25519.X25519(priv[:], remoteEph)
+	if err != nil {
+		return nil, err
+	}
+	orderA, orderB := username, peer
+	ephConcat := append(localEph, remoteEph...)
+	nonceConcat := append(localNonce, remoteNonce...)
+	if peer < username {
+		orderA, orderB = peer, username
+		ephConcat = append(remoteEph, localEph...)
+		nonceConcat = append(remoteNonce, localNonce...)
+	}
+	transcript := bytes.Join([][]byte{
+		[]byte(protocolTag),
+		[]byte(orderA),
+		[]byte(orderB),
+		ephConcat,
+		nonceConcat,
+	}, []byte("|"))
+	h := hkdf.New(sha256.New, shared, nil, transcript)
+	key := make([]byte, chacha20poly1305.KeySize)
+	if _, err := io.ReadFull(h, key); err != nil {
+		return nil, err
+	}
+	aead, err := chacha20poly1305.New(key)
+	if err != nil {
+		return nil, err
+	}
+	return &session{
+		role:        role,
+		peer:        peer,
+		cipher:      aead,
+		transcript:  transcript,
+		sendCounter: 0,
+		recvCounter: -1,
+	}, nil
+}
+
+func (s *session) encrypt(plaintext []byte) (uint64, []byte, error) {
+	nonce := buildNonce(s.role, s.sendCounter)
+	counter := s.sendCounter
+	s.sendCounter++
+	ciphertext := s.cipher.Seal(nil, nonce, plaintext, s.transcript)
+	return counter, ciphertext, nil
+}
+
+func (s *session) decrypt(counter uint64, ciphertext []byte) ([]byte, error) {
+	if int64(counter) <= s.recvCounter {
+		return nil, errors.New("replayed message")
+	}
+	peerRole := "responder"
+	if s.role == "responder" {
+		peerRole = "initiator"
+	}
+	nonce := buildNonce(peerRole, counter)
+	plaintext, err := s.cipher.Open(nil, nonce, ciphertext, s.transcript)
+	if err != nil {
+		return nil, err
+	}
+	s.recvCounter = int64(counter)
+	return plaintext, nil
+}
+
+func buildWSURL(base, username string) (string, error) {
+	parsed, err := url.Parse(base)
+	if err != nil {
+		return "", err
+	}
+	switch parsed.Scheme {
+	case "http":
+		parsed.Scheme = "ws"
+	case "https":
+		parsed.Scheme = "wss"
+	case "ws", "wss":
+	default:
+		return "", fmt.Errorf("unsupported scheme: %s", parsed.Scheme)
+	}
+	path := strings.TrimRight(parsed.Path, "/")
+	if path == "" {
+		path = "/ws"
+	} else {
+		path += "/ws"
+	}
+	parsed.Path = path
+	q := parsed.Query()
+	q.Set("username", username)
+	parsed.RawQuery = q.Encode()
+	return parsed.String(), nil
+}
+
+func prompt(reader *bufio.Reader, label string) string {
+	for {
+		fmt.Print(label)
+		text, _ := reader.ReadString('\n')
+		text = strings.TrimSpace(text)
+		if text != "" {
+			return text
+		}
+	}
+}
+
+func generateEphemeral() ([32]byte, []byte, error) {
+	var priv [32]byte
+	if _, err := rand.Read(priv[:]); err != nil {
+		return priv, nil, err
+	}
+	pub, err := curve25519.X25519(priv[:], curve25519.Basepoint)
+	return priv, pub, err
+}
+
+func randomBytes(n int) ([]byte, error) {
+	buf := make([]byte, n)
+	_, err := rand.Read(buf)
+	return buf, err
+}
+
+func buildNonce(role string, counter uint64) []byte {
+	buf := make([]byte, 12)
+	if role == "initiator" {
+		copy(buf, []byte("INIT"))
+	} else {
+		copy(buf, []byte("RESP"))
+	}
+	binary.BigEndian.PutUint64(buf[4:], counter)
+	return buf
+}
+
+func handshakePayload(event, sender, receiver string, ephPub, nonce []byte) []byte {
+	return bytes.Join([][]byte{
+		[]byte(protocolTag),
+		[]byte(event),
+		[]byte(sender),
+		[]byte(receiver),
+		ephPub,
+		nonce,
+	}, []byte("|"))
+}
+
+func printEnvelope(msg map[string]interface{}) {
+	fmt.Printf("[relay] %s from %v\n", msg["type"], msg["from"])
 }

@@ -83,12 +83,12 @@ Point it at your running registry if you change ports or deploy remotely.
 
 ```bash
 cd goclient
-go build ./...
-./goclient            # or run go run ./...
+go run .                # or go build .
 ```
 
-That directory now holds the entire Go module (including `go.mod` / `go.sum`) so it
-can evolve independently of the Python client.
+That directory now holds a single-file Go client. Each run asks for credentials,
+publishes a fresh Ed25519 key, performs the websocket handshake, and discards
+all state on exit.
 
 ### CLI commands
 
