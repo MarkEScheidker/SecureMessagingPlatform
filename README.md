@@ -9,17 +9,18 @@ inspect and reason about.
 
 ## Repository layout
 
-- `server/` – a tiny FastAPI registry that holds user accounts and their
+- `server/` - a tiny FastAPI registry that holds user accounts and their
   current Ed25519 public keys in memory. It exposes:
   - `POST /accounts` to create usernames with passwords (bcrypt hashes)
   - `POST /keys` to upload or rotate a user's public key
   - `GET /keys/{username}` to retrieve the stored key and version
-- `client/` – an in-memory CLI client implemented with asyncio. It handles:
+- `client/` - an in-memory CLI client implemented with asyncio. It handles:
   - credentials + identity key generation on startup
   - account creation and key publication to the registry
   - UDP broadcast discovery with signed responses
   - mutual authentication and X25519 key agreement (handshake)
   - interactive chat using ChaCha20-Poly1305 with transcript binding
+- `goclient/` - the Go client prototype (websocket/chat/crypto experiments, now self-contained with its own `go.mod`).
 
 Within `client/`, the code is organised into small packages:
 
@@ -77,6 +78,17 @@ python app.py  # CLI prompts for username/password
 
 Environment variable `KEY_SERVER_URL` defaults to `http://127.0.0.1:8000`.
 Point it at your running registry if you change ports or deploy remotely.
+
+### Go client prototype
+
+```bash
+cd goclient
+go build ./...
+./goclient            # or run go run ./...
+```
+
+That directory now holds the entire Go module (including `go.mod` / `go.sum`) so it
+can evolve independently of the Python client.
 
 ### CLI commands
 
