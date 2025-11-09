@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
 
@@ -52,6 +53,8 @@ type wsClient struct {
 	conn     *websocket.Conn
 	incoming chan map[string]interface{}
 }
+
+var errWaitCancelled = errors.New("wait cancelled")
 
 func main() {
 	if err := run(); err != nil {
@@ -104,6 +107,9 @@ func run() error {
 		}
 		sess, err := connectPeer(client, state, peer)
 		if err != nil {
+			if errors.Is(err, errWaitCancelled) {
+				continue
+			}
 			fmt.Printf("[connect] %v\n", err)
 			continue
 		}
@@ -267,31 +273,39 @@ func startSession(client *wsClient, state *appState, peer string) (*session, err
 
 func waitForPeerSession(client *wsClient, state *appState, peer string) (*session, error) {
 	fmt.Printf("Waiting for %s to connect...\n", peer)
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	defer signal.Stop(sigCh)
 	for {
-		msg, err := client.nextMessage()
-		if err != nil {
-			return nil, err
+		select {
+		case <-sigCh:
+			fmt.Println("\n[session] cancelled wait.")
+			return nil, errWaitCancelled
+		case msg, ok := <-client.incoming:
+			if !ok {
+				return nil, errors.New("connection closed")
+			}
+			if msg["type"] != "handshake_init" {
+				continue
+			}
+			payload, _ := msg["payload"].(map[string]interface{})
+			if payload == nil {
+				continue
+			}
+			from := fmt.Sprint(msg["from"])
+			if from != peer {
+				continue
+			}
+			sess, reply, version, err := acceptResponder(state, peer, payload)
+			if err != nil {
+				continue
+			}
+			if err := client.send(peer, "handshake_accept", reply); err != nil {
+				return nil, err
+			}
+			fmt.Printf("[session] connected to %s (key v%d)\n", peer, version)
+			return sess, nil
 		}
-		if msg["type"] != "handshake_init" {
-			continue
-		}
-		payload, _ := msg["payload"].(map[string]interface{})
-		if payload == nil {
-			continue
-		}
-		from := fmt.Sprint(msg["from"])
-		if from != peer {
-			continue
-		}
-		sess, reply, version, err := acceptResponder(state, peer, payload)
-		if err != nil {
-			continue
-		}
-		if err := client.send(peer, "handshake_accept", reply); err != nil {
-			return nil, err
-		}
-		fmt.Printf("[session] connected to %s (key v%d)\n", peer, version)
-		return sess, nil
 	}
 }
 
@@ -299,7 +313,11 @@ func chat(client *wsClient, sess *session) {
 	const promptLabel = "you> "
 	fmt.Printf("Chatting with %s. Use /leave to exit.\n", sess.peer)
 
-	rl, err := readline.New(promptLabel)
+	cancelable := readline.NewCancelableStdin(readline.Stdin)
+	rl, err := readline.NewEx(&readline.Config{
+		Prompt: promptLabel,
+		Stdin:  cancelable,
+	})
 	if err != nil {
 		fmt.Printf("[chat] failed to initialize prompt: %v\n", err)
 		return
@@ -335,6 +353,7 @@ func chat(client *wsClient, sess *session) {
 	cleanup := func() {
 		cleanupOnce.Do(func() {
 			close(stop)
+			cancelable.Close()
 			rl.Close()
 			readerWG.Wait()
 		})
