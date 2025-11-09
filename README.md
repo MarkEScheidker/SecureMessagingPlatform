@@ -14,30 +14,24 @@ inspect and reason about.
   - `POST /accounts` to create usernames with passwords (bcrypt hashes)
   - `POST /keys` to upload or rotate a user's public key
   - `GET /keys/{username}` to retrieve the stored key and version
-- `client/` - an in-memory CLI client implemented with asyncio. It handles:
-  - credentials + identity key generation on startup
-  - account creation and key publication to the registry
-  - UDP broadcast discovery with signed responses
-  - mutual authentication and X25519 key agreement (handshake)
-  - interactive chat using ChaCha20-Poly1305 with transcript binding
-- `goclient/` - the Go client prototype (websocket/chat/crypto experiments, now self-contained with its own `go.mod`).
+- `goclient/` - a self-contained Go CLI client that publishes keys, handles
+  websocket signaling, performs the authenticated X25519 handshake, and drops
+  into an encrypted chat loop (backed by its own `go.mod`).
 
-Within `client/`, the code is organised into small packages:
+Within `goclient/`, most of the logic lives in a single entrypoint for easy auditing:
 
 ```
-client/
-├─ app.py              # script entrypoint that bootstraps the CLI
-├─ cli/                # command loop and argument parsing
-├─ chat/               # interactive send/receive routines
-├─ common/             # shared config, state container, and utilities
-├─ crypto/             # session wrapper and handshake helpers
-└─ network/            # discovery, registry HTTP calls, framing, dial/listen
+goclient/
+|-- client.go      # interactive CLI + crypto helpers
+|-- go.mod
+`-- go.sum
 ```
+
 
 ## Requirements
 
-- Python 3.11+
-- `pip install -r client/requirements.txt`
+- Python 3.11+ if you prefer to run the FastAPI server directly instead of Docker
+- Go 1.25+ for the CLI client in `goclient/` (the module targets Go 1.25.1)
 - (Optional) Docker if you prefer to run the FastAPI server via
   `docker compose`
 
@@ -68,52 +62,36 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 Either approach provides the same API surface; use whichever fits your
 environment.
 
-## Running the client
-
-```bash
-cd client
-pip install -r requirements.txt
-python app.py  # CLI prompts for username/password
-```
-
-Environment variable `KEY_SERVER_URL` defaults to `http://127.0.0.1:8000`.
-Point it at your running registry if you change ports or deploy remotely.
-
-### Go client prototype
+## Running the Go client
 
 ```bash
 cd goclient
-go run .                # or go build .
+go run .    # or go build .
 ```
 
-That directory now holds a single-file Go client. Each run asks for credentials,
-publishes a fresh Ed25519 key, performs the websocket handshake, and discards
-all state on exit.
+On startup the client prompts for a username/password, generates a fresh
+Ed25519 identity, publishes it with `POST /keys`, and connects to the registry's
+websocket endpoint at `<server>/ws`. You will then be asked which peer username
+to contact; once the peer accepts, the Go client performs the authenticated
+X25519 handshake, derives chat keys, and drops into an encrypted session. Type
+`/leave` or `/quit` to end the chat and return to the peer prompt. Each run
+discards its keys and session state when the process exits.
 
-### CLI commands
+The default server URL lives in `goclient/client.go` as `defaultServer` (it
+currently points at `https://scheidker.com`). Change it to
+`http://127.0.0.1:8000` before building if you're running the FastAPI registry
+locally, or adjust it to match any other deployment.
 
-Once authenticated the CLI exposes the following commands:
-
-- `discover [port]` – broadcast on the LAN to find peers listening on the
-  given UDP/TCP port (default `4040`). Responses are verified using the
-  registry’s published keys.
-- `listen [port]` – announce presence, accept a single inbound connection,
-  run the authenticated handshake, then drop into the encrypted chat loop.
-- `connect <peer> [port]` – dial a known peer by username (address learned
-  from discovery or previous sessions). You can also specify
-  `connect <host> <peer> [port]` to target a specific address manually.
-- `help`, `quit` – show help or exit the program.
-
-All secrets (password, Ed25519 identity key, session keys) live only in
-memory. Closing the CLI clears them, forcing a fresh keypair next time.
+All secrets (password, Ed25519 identity key, session keys) live only in memory
+inside the Go process. Restarting the CLI forces a fresh identity.
 
 ## Protocol summary
 
 1. **Account + key publication** – the CLI registers with the server,
    uploading an Ed25519 public key bound to the username.
-2. **Discovery** – listeners broadcast signed announcements using that
-   identity key; initiators fetch the expected key from the registry and
-   verify the signature.
+2. **Signaling** - each client keeps a websocket open to `/ws`. Messages are
+   relayed by username so initiators can page a peer, fetch their Ed25519 key,
+   and confirm it against the registry before proceeding.
 3. **Handshake** – both sides generate ephemeral X25519 keys, sign them
    with their Ed25519 identity, verify the peer via the registry, and feed
    the Diffie-Helman shared secret into HKDF. The transcript (ids, nonces,
@@ -129,10 +107,11 @@ the registry’s ability to distribute correct public keys.
 
 - The server intentionally skips persistence so resetting state is as easy
   as restarting the process/container.
-- Because the client relies on UDP broadcast for discovery, you’ll need to
-  run peers on the same network segment (or specify host/port explicitly).
-- `python -m compileall client` is a quick way to sanity-check for syntax
-  errors after code changes.
+- The Go client expects a reachable websocket endpoint at `<server>/ws`; adjust
+  `defaultServer` (or refactor it into a flag) when hopping between local and
+  remote registries.
+- `go fmt ./goclient && go build ./goclient` are quick sanity checks before
+  pushing changes.
 
 Enjoy experimenting with the protocol! Contributions that extend the
 handshake analysis, add persistence, or explore alternative authentication
