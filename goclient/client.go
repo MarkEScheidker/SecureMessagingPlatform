@@ -71,14 +71,21 @@ func run() error {
 		return errors.New("password cannot be empty")
 	}
 
+	var server string
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return err
 	}
+	if os.Getenv("SMSERVER_HOST") == "" {
+		server = defaultServer
+
+	} else {
+		server = os.Getenv("SMSERVER_HOST")
+	}
 	state := &appState{
 		username: username,
 		password: password,
-		server:   defaultServer,
+		server:   server,
 		priv:     priv,
 		pub:      pub,
 	}
