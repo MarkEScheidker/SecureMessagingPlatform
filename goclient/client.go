@@ -52,6 +52,8 @@ type session struct {
 type wsClient struct {
 	conn     *websocket.Conn
 	incoming chan map[string]interface{}
+	mu       sync.Mutex
+	pending  []map[string]interface{}
 }
 
 var errWaitCancelled = errors.New("wait cancelled")
@@ -157,6 +159,35 @@ func newWSClient(conn *websocket.Conn) *wsClient {
 	return c
 }
 
+func (c *wsClient) stashMessage(msg map[string]interface{}) {
+	if msg == nil {
+		return
+	}
+	c.mu.Lock()
+	c.pending = append(c.pending, msg)
+	c.mu.Unlock()
+}
+
+func (c *wsClient) takePending(match func(map[string]interface{}) bool) (map[string]interface{}, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.pending) == 0 {
+		return nil, false
+	}
+	if match == nil {
+		msg := c.pending[0]
+		c.pending = c.pending[1:]
+		return msg, true
+	}
+	for i, msg := range c.pending {
+		if match(msg) {
+			c.pending = append(c.pending[:i], c.pending[i+1:]...)
+			return msg, true
+		}
+	}
+	return nil, false
+}
+
 func (c *wsClient) send(to, msgType string, payload interface{}) error {
 	envelope := map[string]interface{}{
 		"to":      to,
@@ -167,6 +198,11 @@ func (c *wsClient) send(to, msgType string, payload interface{}) error {
 }
 
 func (c *wsClient) nextMessage() (map[string]interface{}, error) {
+	if msg, ok := c.takePending(func(m map[string]interface{}) bool {
+		return fmt.Sprint(m["type"]) != "handshake_init"
+	}); ok {
+		return msg, nil
+	}
 	msg, ok := <-c.incoming
 	if !ok {
 		return nil, errors.New("connection closed")
@@ -283,7 +319,45 @@ func waitForPeerSession(client *wsClient, state *appState, peer string) (*sessio
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt)
 	defer signal.Stop(sigCh)
+
+	handleHandshake := func(msg map[string]interface{}) (*session, error) {
+		if fmt.Sprint(msg["type"]) != "handshake_init" {
+			return nil, nil
+		}
+		payload, _ := msg["payload"].(map[string]interface{})
+		if payload == nil {
+			return nil, nil
+		}
+		from := fmt.Sprint(msg["from"])
+		if from != peer {
+			client.stashMessage(msg)
+			return nil, nil
+		}
+		sess, reply, version, err := acceptResponder(state, peer, payload)
+		if err != nil {
+			return nil, nil
+		}
+		if err := client.send(peer, "handshake_accept", reply); err != nil {
+			return nil, err
+		}
+		fmt.Printf("[session] connected to %s (key v%d)\n", peer, version)
+		return sess, nil
+	}
+
 	for {
+		if msg, ok := client.takePending(func(m map[string]interface{}) bool {
+			return fmt.Sprint(m["type"]) == "handshake_init" && fmt.Sprint(m["from"]) == peer
+		}); ok {
+			sess, err := handleHandshake(msg)
+			if err != nil {
+				return nil, err
+			}
+			if sess != nil {
+				return sess, nil
+			}
+			continue
+		}
+
 		select {
 		case <-sigCh:
 			fmt.Println("\n[session] cancelled wait.")
@@ -292,26 +366,13 @@ func waitForPeerSession(client *wsClient, state *appState, peer string) (*sessio
 			if !ok {
 				return nil, errors.New("connection closed")
 			}
-			if msg["type"] != "handshake_init" {
-				continue
-			}
-			payload, _ := msg["payload"].(map[string]interface{})
-			if payload == nil {
-				continue
-			}
-			from := fmt.Sprint(msg["from"])
-			if from != peer {
-				continue
-			}
-			sess, reply, version, err := acceptResponder(state, peer, payload)
+			sess, err := handleHandshake(msg)
 			if err != nil {
-				continue
-			}
-			if err := client.send(peer, "handshake_accept", reply); err != nil {
 				return nil, err
 			}
-			fmt.Printf("[session] connected to %s (key v%d)\n", peer, version)
-			return sess, nil
+			if sess != nil {
+				return sess, nil
+			}
 		}
 	}
 }
@@ -416,7 +477,9 @@ func chat(client *wsClient, sess *session) {
 				fmt.Println("[relay] connection closed.")
 				return
 			}
-			if msg["type"] == "chat" && msg["from"] == sess.peer {
+			msgType := fmt.Sprint(msg["type"])
+			switch {
+			case msgType == "chat" && msg["from"] == sess.peer:
 				if err := displayChat(sess, msg["payload"], rl.Stdout()); err != nil {
 					clearPrompt()
 					cleanup()
@@ -424,14 +487,17 @@ func chat(client *wsClient, sess *session) {
 					return
 				}
 				rl.Refresh()
-				continue
-			} else if msg["type"] == "chat_leave" && msg["from"] == sess.peer {
+			case msgType == "chat_leave" && msg["from"] == sess.peer:
 				clearPrompt()
 				cleanup()
 				fmt.Printf("[session] %s left the chat.\n", sess.peer)
 				return
-			} else {
-				fmt.Fprintf(rl.Stdout(), "[relay] %s from %v\n", msg["type"], msg["from"])
+			case strings.HasPrefix(msgType, "handshake_"):
+				client.stashMessage(msg)
+				fmt.Fprintf(rl.Stdout(), "[relay] %s from %v (queued)\n", msgType, msg["from"])
+				rl.Refresh()
+			default:
+				fmt.Fprintf(rl.Stdout(), "[relay] %s from %v\n", msgType, msg["from"])
 				rl.Refresh()
 			}
 		}
