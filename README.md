@@ -107,9 +107,8 @@ the registry’s ability to distribute correct public keys.
 
 - The server intentionally skips persistence so resetting state is as easy
   as restarting the process/container.
-- The Go client expects a reachable websocket endpoint at `<server>/ws`; adjust
-  `defaultServer` (or refactor it into a flag) when hopping between local and
-  remote registries.
+- The Go client expects a reachable websocket endpoint at `<server>/ws`; add 
+  environment variable `SMSSMSERVER_HOST` with prefered host as `http[s]//host.tld`.
 - `go fmt ./goclient && go build ./goclient` are quick sanity checks before
   pushing changes.
 
