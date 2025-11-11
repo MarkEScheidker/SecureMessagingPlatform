@@ -1,4 +1,0 @@
-PyQt6
-httpx
-cryptography
-websockets
