@@ -40,6 +40,7 @@ type appState struct {
 	pub      ed25519.PublicKey
 }
 
+// session holds the AEAD handle plus the per-role counters used for unique nonces.
 type session struct {
 	role        string
 	peer        string
@@ -49,6 +50,7 @@ type session struct {
 	recvCounter int64
 }
 
+// wsClient wraps the relay websocket so we can queue handshake traffic safely.
 type wsClient struct {
 	conn     *websocket.Conn
 	incoming chan map[string]interface{}
@@ -146,6 +148,7 @@ func newWSClient(conn *websocket.Conn) *wsClient {
 		conn:     conn,
 		incoming: make(chan map[string]interface{}, 8),
 	}
+	// Background reader demultiplexes websocket frames into our buffered channel.
 	go func() {
 		for {
 			var msg map[string]interface{}
@@ -163,6 +166,7 @@ func (c *wsClient) stashMessage(msg map[string]interface{}) {
 	if msg == nil {
 		return
 	}
+	// Keep unexpected traffic so critical handshake messages can be processed first.
 	c.mu.Lock()
 	c.pending = append(c.pending, msg)
 	c.mu.Unlock()
@@ -210,7 +214,9 @@ func (c *wsClient) nextMessage() (map[string]interface{}, error) {
 	return msg, nil
 }
 
+// publishKey pushes our Ed25519 public key to the HTTPS introducer for verification.
 func publishKey(state *appState) error {
+	// User credentials protect the upload endpoint; key material never leaves TLS.
 	body, _ := json.Marshal(map[string]string{
 		"username":   state.username,
 		"password":   state.password,
@@ -232,6 +238,7 @@ func publishKey(state *appState) error {
 	return nil
 }
 
+// fetchKey retrieves the introducer-vouched key so impostors get rejected early.
 func fetchKey(server, username string) ([]byte, int, error) {
 	endpoint := strings.TrimRight(server, "/") + "/keys/" + url.PathEscape(username)
 	resp, err := http.Get(endpoint)
@@ -253,6 +260,7 @@ func fetchKey(server, username string) ([]byte, int, error) {
 	return pub, data.KeyVersion, err
 }
 
+// connectPeer deterministically decides who initiates so only one handshake runs.
 func connectPeer(client *wsClient, state *appState, peer string) (*session, error) {
 	peer = strings.TrimSpace(peer)
 	if peer == "" {
@@ -267,11 +275,13 @@ func connectPeer(client *wsClient, state *appState, peer string) (*session, erro
 	return waitForPeerSession(client, state, peer)
 }
 
+// startSession runs the initiator half: generate X25519+nonce, sign, send.
 func startSession(client *wsClient, state *appState, peer string) (*session, error) {
 	peerKey, version, err := fetchKey(state.server, peer)
 	if err != nil {
 		return nil, err
 	}
+	// Fresh X25519 key pair prevents key reuse and gives forward secrecy per chat.
 	priv, pub, err := generateEphemeral()
 	if err != nil {
 		return nil, err
@@ -314,6 +324,7 @@ func startSession(client *wsClient, state *appState, peer string) (*session, err
 	}
 }
 
+// waitForPeerSession listens until the target's signed handshake_init arrives.
 func waitForPeerSession(client *wsClient, state *appState, peer string) (*session, error) {
 	fmt.Printf("Waiting for %s to connect...\n", peer)
 	sigCh := make(chan os.Signal, 1)
@@ -360,6 +371,7 @@ func waitForPeerSession(client *wsClient, state *appState, peer string) (*sessio
 
 		select {
 		case <-sigCh:
+			// Allow Ctrl+C to break out without killing the entire client.
 			fmt.Println("\n[session] cancelled wait.")
 			return nil, errWaitCancelled
 		case msg, ok := <-client.incoming:
@@ -377,6 +389,7 @@ func waitForPeerSession(client *wsClient, state *appState, peer string) (*sessio
 	}
 }
 
+// chat ties readline input to the encrypted websocket and handles clean teardown.
 func chat(client *wsClient, sess *session) {
 	const promptLabel = "you> "
 	fmt.Printf("Chatting with %s. Use /leave to exit.\n", sess.peer)
@@ -509,6 +522,7 @@ func sendChat(client *wsClient, sess *session, text string) error {
 	if err != nil {
 		return err
 	}
+	// Send the counter (nonce) in plaintext so the receiver can enforce ordering.
 	payload := map[string]interface{}{
 		"nonce":      counter,
 		"ciphertext": base64.StdEncoding.EncodeToString(ciphertext),
@@ -535,6 +549,7 @@ func displayChat(sess *session, payload interface{}, w io.Writer) error {
 	return nil
 }
 
+// completeInitiator checks the responder signature before deriving the session key.
 func completeInitiator(state *appState, peer string, peerKey []byte, ephPriv [32]byte, localEph []byte, localNonce []byte, payload map[string]interface{}) (*session, error) {
 	if payload == nil {
 		return nil, errors.New("missing payload")
@@ -561,12 +576,14 @@ func completeInitiator(state *appState, peer string, peerKey []byte, ephPriv [32
 	return deriveSession("initiator", state.username, peer, ephPriv, localEph, peerEph, localNonce, peerNonce)
 }
 
+// acceptResponder validates the init payload, then signs and returns its own share.
 func acceptResponder(state *appState, expected string, payload map[string]interface{}) (*session, map[string]string, int, error) {
 	username, _ := payload["username"].(string)
 	target, _ := payload["target"].(string)
 	if username == "" || target != state.username || username != expected {
 		return nil, nil, 0, errors.New("target mismatch")
 	}
+	// Defensive decoding: any malformed base64 means we bail instead of trusting data.
 	nonceStr, _ := payload["nonce"].(string)
 	ephStr, _ := payload["ephemeral"].(string)
 	sigStr, _ := payload["signature"].(string)
@@ -614,6 +631,7 @@ func acceptResponder(state *appState, expected string, payload map[string]interf
 	return sess, reply, version, nil
 }
 
+// deriveSession HKDFs the shared secret with the ordered transcript for binding.
 func deriveSession(role, username, peer string, priv [32]byte, localEph, remoteEph, localNonce, remoteNonce []byte) (*session, error) {
 	shared, err := curve25519.X25519(priv[:], remoteEph)
 	if err != nil {
@@ -653,6 +671,7 @@ func deriveSession(role, username, peer string, priv [32]byte, localEph, remoteE
 	}, nil
 }
 
+// encrypt uses ChaCha20-Poly1305 with transcript AAD and role-tagged counters.
 func (s *session) encrypt(plaintext []byte) (uint64, []byte, error) {
 	nonce := buildNonce(s.role, s.sendCounter)
 	counter := s.sendCounter
@@ -661,6 +680,7 @@ func (s *session) encrypt(plaintext []byte) (uint64, []byte, error) {
 	return counter, ciphertext, nil
 }
 
+// decrypt rejects stale counters before opening the AEAD with the mirrored nonce.
 func (s *session) decrypt(counter uint64, ciphertext []byte) ([]byte, error) {
 	if int64(counter) <= s.recvCounter {
 		return nil, errors.New("replayed message")
@@ -731,6 +751,7 @@ func randomBytes(n int) ([]byte, error) {
 	return buf, err
 }
 
+// buildNonce adds INIT/RESP prefixes to monotonic counters for unique AEAD nonces.
 func buildNonce(role string, counter uint64) []byte {
 	buf := make([]byte, 12)
 	if role == "initiator" {
